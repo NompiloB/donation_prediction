@@ -1,0 +1,298 @@
+# load and initiate H2o package
+library(h2o)
+Sys.setenv(JAVA_HOME = "C:/Program Files/Eclipse Adoptium/jdk-21.0.7.6-hotspot")
+h2o.init()
+# Load additional packages
+library(dplyr) # for data manipulation and preprocessing
+library(caTools) # for splitting into train and test sets
+library(caret) # used for performance metric functions
+library(pROC) # used for obtaining AUC
+install.packages("here")
+library(here)
+
+
+# load data
+load(here::here("data", "donations_sample.RData"))
+
+# set seed
+seed <- 951
+set.seed(seed)
+
+summary(donations)
+
+# Determine the number of levels (cardinality) of the factor variables:
+
+sapply(Filter(is.factor, donations), nlevels)
+
+# convert to data frame:
+
+donations <- as.data.frame(donations)
+str(donations)
+
+# #check class distribution of target variable, in this case Donated is our target variable
+prop.table(table(donations$Donated))
+
+# Split the data into train/test sets
+
+# set a seed for reproducibility
+set.seed(seed)
+
+split <- sample.split(donations$Donated, SplitRatio = 0.75)
+
+train <- subset(donations, split == "TRUE")
+test <- subset(donations, split == "FALSE")
+
+summary(donations$Donated)
+
+# load ROSE package
+install.packages("ROSE") 	# used for over and under sampling and combination of the two
+library(ROSE)
+
+# balance the training set using a combination of both over- and under-sampling, where the number of minority cases increases and the number of majority cases decreases.
+total_both <- nrow(train)
+
+fraction_Donated_new <- 0.50	# specify the approx proportion of minority cases to be produced. Keep it at 50/50
+
+train_both <- ovun.sample(
+  Donated ~ .,
+  data = train,
+  method = "both",
+  N = total_both,
+  p = fraction_Donated_new,		
+  seed = seed
+)
+
+# Extract and save the resulting over & under-sampled data (list):
+train_both_data <- train_both$data
+summary(train_both_data$Donated)
+
+#normalize data - scale and centre
+train_norm_parameters <- preProcess(train_both_data, method = c("center", "scale"))
+
+?predict
+
+train_scaled <- predict(train_norm_parameters,train_both_data)
+test_scaled <- predict(train_norm_parameters,test)
+
+summary(train_scaled)
+summary(test_scaled)
+
+
+## Dummy variable encoding (test and training sets)
+# load recipes package
+
+library(recipes)
+
+#1. define the model (recipe) so that the function knows what is the target
+rec <- recipe(Donated ~ ., data = train_scaled) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) 
+
+# 2. Prep the recipe using the scaled training data
+rec_prep <- prep(rec, training = train_scaled)
+
+# 3. Apply (bake) the prepped recipe on the scaled training set 
+train_processed <- bake(rec_prep, new_data = NULL) #NULL means applying to trained set specified in prep rec
+
+# for NNs we do not want to drop the redundant columns because we want to see how each category contributes to predictions in model e.g how important is it to be female or male
+
+# fix names of columns which include a period:
+colnames(train_processed) <- make.names(colnames(train_processed))
+
+# 4. Apply (bake) the same transformations to the scaled test set
+test_processed <- bake(rec_prep, new_data = test_scaled)
+
+# fix names of columns which include a period:
+colnames(test_processed) <- make.names(colnames(test_processed))
+
+summary(train_processed)
+summary(test_processed)
+
+# Convert train and test sets into H2O data frames
+train_h2o <- as.h2o(train_processed)
+test_h2o <- as.h2o(test_processed)
+
+# Specify name of target and predictors
+
+target <- "Donated"
+predictors <- setdiff(names(train_processed), target)
+
+### Train Neural Network ####
+
+# Set hyperparameters for grid search
+hyper_params <- list(
+  hidden = list(c(3, 5), c(3, 5, 7)),
+  activation = c("Rectifier", "Tanh"),
+  epochs = c(15, 20),
+  rate = c(0.001, 0.09, by = 0.01))
+
+# Perform grid search for hyperparameter tuning
+grid_search <- h2o.grid(
+  algorithm = "deeplearning", #for NN - algorithm corresponds to model we are fitting
+  grid_id = "nn_grid",
+  hyper_params = hyper_params,
+  x = predictors,
+  y = target,
+  standardize = FALSE, # this has already been done
+  training_frame = train_h2o,
+  search_criteria = list(strategy = "Cartesian"),
+  adaptive_rate = FALSE,
+  nfolds = 5, # Cross validation 5-fold
+  stopping_rounds = 0, # turn off early stopping
+  seed = seed
+)
+
+# View grid sorted by logloss (change metric if needed) 
+#next step extracts results from fitted object containing all different combos of hyperp values as well as corresponding cv results pertaining to fitted models using those combos
+grid_results <- h2o.getGrid(grid_id = "nn_grid", 
+                            sort_by = "logloss", 
+                            decreasing = FALSE)
+
+print(grid_results) #See results of tuned hyperps
+
+# extract information pertaining to best model
+best_model <- h2o.getModel(grid_results@model_ids[[1]])
+
+best_params <- best_model@allparameters
+print(best_params) # opens list of all hyperps associated (some set to default bcs we have not encoprated them into grid search) with the final NN we will train on the full train set
+
+# Fit full NN on train data set 
+NN <- h2o.deeplearning(
+  x = predictors,
+  y = target,
+  training_frame = train_h2o, 
+  hidden = best_params$hidden,
+  activation = best_params$activation,
+  rate = best_params$rate,
+  adaptive_rate = FALSE,
+  epochs = best_params$epochs,
+  seed = seed
+) 
+
+# extract variable importance
+var_imp_NN <- h2o.varimp(NN)
+View(var_imp_NN)
+h2o.varimp_plot(NN)
+
+# Extract predicted probabilities for use in finding optimal cut-off in later steps
+preds_NN_train <- h2o.predict(NN, train_h2o)
+preds_NN_test <- h2o.predict(NN, test_h2o)
+
+# Convert predictions to R data.frames to extract from H2O environment:
+preds_NN_train <- as.data.frame(preds_NN_train)
+preds_NN_test <- as.data.frame(preds_NN_test)
+
+
+# load relevant library for Optimal cutoff
+library(cutpointr)
+
+# determine cut-off point/parameter
+
+cp <- cutpointr(preds_NN_train$Yes, 
+                train_processed$Donated,
+                pos_class = "Yes", # the class label we are interested in
+                method = maximize_metric, 
+                metric = youden)
+
+summary(cp)
+
+
+#### Train random forest model ####
+
+#Define / specify hyperparameter grid for DRF
+hyper_params_drf <- list(
+  ntrees = c(100), 
+  max_depth = c(50),
+  min_rows = c(5, 20, by = 5)
+)
+
+# Perform grid search using H2OGrid
+grid_search_drf <- h2o.grid(
+  algorithm = "drf",
+  grid_id = "drf_grid",
+  x = predictors,
+  y = target,
+  training_frame = train_h2o,
+  hyper_params = hyper_params_drf,
+  search_criteria = list(strategy = "Cartesian"),
+  nfolds = 5,
+  seed = seed
+)
+
+# Get the grid results of tuned hyperps, sorted by logloss
+grid_results_drf <- h2o.getGrid(grid_id = "drf_grid", 
+                                sort_by = "logloss", 
+                                decreasing = FALSE)
+
+print(grid_results_drf)
+
+# extract best model
+best_model_drf <- h2o.getModel(grid_results_drf@model_ids[[1]])
+
+best_params_drf <- best_model_drf@allparameters
+print(best_params_drf)
+
+
+# Build and train the drf model based on the tuned hyperparameters extracted from prev step:
+drf <- h2o.randomForest(
+  x = predictors,
+  y = target,
+  ntrees = best_params_drf$ntrees,
+  max_depth = best_params_drf$max_depth,
+  min_rows = best_params_drf$min_rows,
+  #sample_rate = best_params_drf$sample_rate,
+  #col_sample_rate_per_tree = best_params_drf$col_sample_rate_per_tree,
+  training_frame = train_h2o,
+  seed=seed,
+  nfold =5,
+  keep_cross_validation_predictions = TRUE
+)
+
+# Save predicted probabilities
+preds_drf_train <- h2o.predict(drf, train_h2o)
+preds_drf_test <- h2o.predict(drf, test_h2o)
+
+# Convert predictions to R data.frames to extract from H2O environment:
+preds_drf_train <- as.data.frame(preds_drf_train)
+preds_drf_test <- as.data.frame(preds_drf_test)
+
+train_drf_pred <- cbind(train_processed, preds_drf_train[, "Yes", drop = FALSE])
+test_drf_pred <- cbind(test_processed, preds_drf_test[, "Yes", drop = FALSE])
+
+# Create confusion matrix using a threshold:
+
+threshold <- 0.35
+
+# training
+train_drf_pred$pred_class <- factor(ifelse(train_drf_pred$Yes > threshold,"Yes","No"))
+
+# predicted classes first then actual classes
+caret::confusionMatrix(
+  train_drf_pred$pred_class,
+  train_drf_pred$Donated,
+  positive = "Yes",
+  mode = "everything"
+)
+
+
+# actual classes first then predicted probabilities
+roc_drf_train <- pROC::roc(train_drf_pred$Donated, train_drf_pred$Yes)
+pROC::auc(roc_drf_train)
+plot(roc_drf_train)
+
+rlang::last_trace()
+  
+
+# test
+test_drf_pred$pred_class <- factor(ifelse(test_drf_pred$Yes > threshold, "Yes", "No"))
+
+# predicted classes first then actual classes
+caret::confusionMatrix(
+  test_drf_pred$pred_class,
+  test_drf_pred$Donated,
+  positive = "Yes",
+  mode = "everything"
+)
+
+roc_drf_test <- pROC::roc(test_drf_pred$Donated, test_drf_pred$Yes)
+pROC::auc(roc_drf_test)
+plot(roc_drf_test)
